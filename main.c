@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/param.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "cmd_parse.h"
 
@@ -19,6 +21,8 @@ int
 main( int argc, char *argv[] )
 {
     int ret = 0;
+
+    umask(0);
 
     simple_argv(argc, argv);
     ret = process_user_input_simple();

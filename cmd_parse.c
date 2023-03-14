@@ -3,15 +3,22 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <fcntl.h>
 #include <sys/param.h>
+#include <sys/wait.h>
+#include <errno.h>
 
 #include "cmd_parse.h"
+
+#define HIST_CMD "history"
+#define HIST 10
 
 // I have this a global so that I don't have to pass it to every
 // function where I might want to use it. Yes, I know global variables
 // are frowned upon, but there are a couple useful uses for them.
 // This is one.
 unsigned short isVerbose = 0;
+char *hist[HIST] = {0};
 
 int 
 process_user_input_simple(void)
@@ -23,6 +30,7 @@ process_user_input_simple(void)
     int cmd_count = 0;
     char prompt[30];
 
+    memset(hist, 0, sizeof(hist));
     // Set up a cool user prompt.
     sprintf(prompt, PROMPT_STR " %s β: ", getenv("LOGNAME"));
     for ( ; ; ) {
@@ -51,6 +59,7 @@ process_user_input_simple(void)
         if (strcmp(str, QUIT_CMD) == 0) {
             // Pickup your toys and go home. I just hope there are not
             // any memory leaks. ;-)
+
             break;
         }
         // Basic commands are pipe delimited.
@@ -96,6 +105,12 @@ process_user_input_simple(void)
         cmd_list = NULL;
     }
 
+    free(hist[HIST-1]);
+    for (int i = HIST - 2 ; i >= 0; i--){
+        hist[i+1] = hist[i];
+    }
+    hist[0] = strdup(str);
+
     return(EXIT_SUCCESS);
 }
 
@@ -137,12 +152,17 @@ void
 exec_commands( cmd_list_t *cmds ) 
 {
     cmd_t *cmd = cmds->head;
+    param_t *curr = NULL;
 
     if (1 == cmds->count) {
         if (!cmd->cmd) {
             // if it is an empty command, bail.
             return;
         }
+        free(hist[HIST-1]);
+        memmove(&(hist[1]), &(hist[0]), (HIST -1) * sizeof(char*));
+        hist[0] = cmd->cmd;
+                
         if (0 == strcmp(cmd->cmd, CD_CMD)) {
             if (0 == cmd->param_count) {
                 // Just a "cd" on the command line without a target directory
@@ -151,6 +171,7 @@ exec_commands( cmd_list_t *cmds )
                 // Is there an environment variable, somewhere, that contains
                 // the HOME directory that could be used as an argument to
                 // the chdir() fucntion?
+                chdir(getenv("HOME"));
             }
             else {
                 // try and cd to the target directory. It would be good to check
@@ -171,21 +192,80 @@ exec_commands( cmd_list_t *cmds )
             getcwd(str, MAXPATHLEN); 
             printf(" " CWD_CMD ": %s\n", str);
         }
+        //the history command
+        else if (0 == strcmp(cmd->cmd, HIST_CMD)) {
+            int x = 0;
+            for (int ind = HIST - 1; ind >= 0 ; ind--){
+                if (hist[ind] != NULL){
+                    printf("%d: %s", ++x, hist[ind]);
+                    printf("\n");
+                }
+            }
+            printf("\n");
+        }
         else if (0 == strcmp(cmd->cmd, ECHO_CMD)) {
             // insert code here
             // insert code here
             // Is that an echo?
+            
+            param_t *temp = cmd->param_list;
+            if (temp == NULL){
+                return;
+            }
+            while (temp->next){
+                printf("%s ", temp->param);
+                temp = temp->next;
+            }
+                printf("%s\n", temp->param);
+
         }
         else {
             // A single command to create and exec
             // If you really do things correctly, you don't need a special call
             // for a single command, as distinguished from multiple commands.
+            
             pid_t pid = fork();
 
-            /*
+            
             //child process
             if (pid == 0){
-                execvp(cmd->cmd, cmd->param_list);
+                //copy the params list
+                //char **params = (char**)malloc(sizeof(char*) * (cmd->param_count + 1));
+                char **params = (char**)calloc((cmd->param_count)+2, sizeof(char*));
+                params[0] = cmd->cmd;
+                curr= cmd->param_list;
+
+                for (int i = 1 ; i <= cmd->param_count ; i++){
+                    params[i] = cmd->param_list->param;
+                    curr = curr->next;
+                }
+
+            
+                if (REDIRECT_FILE == cmd->input_src) {
+                    int fd;
+                    fd = open(cmd->input_file_name, O_RDONLY);
+                    if (fd < 0) {
+                        fprintf(stderr, "******* redir in failed %d *******\n", errno);
+                        exit(7);
+                    }
+
+                    dup2(fd, STDIN_FILENO);
+                    close(fd);
+                }
+                if (REDIRECT_FILE == cmd->output_dest) {
+                    int fd;
+                    fd = open(cmd->output_file_name, O_WRONLY | O_TRUNC | O_CREAT, 0666);
+                    if (fd < 0) {
+                        fprintf(stderr, "******* redir out in failed %d *******\n", errno);
+                        exit(7);
+                    }
+
+                dup2(fd, STDOUT_FILENO);
+                close(fd);
+            }
+            
+
+                execvp(params[0], params);
                 //shouldn't return
                 perror("you had a little wuh oh accident in your exec_commands func in cmd_parse.h");
                 exit(1);
@@ -202,13 +282,99 @@ exec_commands( cmd_list_t *cmds )
             else {
                 perror("failed to fork");
             }
-            */
         }
-    }
-    else {
+       
+    }else {
         // Other things???
         // More than one command on the command line. Who'da thunk it!
         // This really falls into Stage 2.
+
+        //this part will loop while we still have commands
+        int ptrail = 0;
+        int filedes[2];
+        pid_t pid = -1;
+
+        while(cmd){
+            char **params = (char**)calloc((cmd->param_count)+2, sizeof(char*));
+            //not last
+            if (cmd != cmds->tail){
+                //make our pipe
+                pipe(filedes);
+            }
+
+            //fork stuff
+            pid = fork();
+            
+            //child process
+            if (pid == 0){
+                //check if not first
+                if (cmd != cmds->head){
+                    dup2(ptrail, STDIN_FILENO);
+                }
+                //check if not last
+                if (cmd != cmds->tail){
+                    dup2(filedes[STDOUT_FILENO], STDOUT_FILENO);
+                    close(filedes[STDIN_FILENO]);
+                    close(filedes[STDOUT_FILENO]);
+
+                }
+                //exec with ragged aray
+                params[0] = cmd->cmd;
+                curr= cmd->param_list;
+
+                for (int i = 1 ; i <= cmd->param_count ; i++){
+                    params[i] = cmd->param_list->param;
+                    curr = curr->next;
+                }
+
+
+                if (REDIRECT_FILE == cmd->input_src) {
+                    int fd;
+                    fd = open(cmd->input_file_name, O_RDONLY);
+                    if (fd < 0) {
+                        fprintf(stderr, "******* redir in failed %d *******\n", errno);
+                        exit(7);
+                    }
+
+                    dup2(fd, STDIN_FILENO);
+                    close(fd);
+                }
+                if (REDIRECT_FILE == cmd->output_dest) {
+                    int fd;
+                    fd = open(cmd->output_file_name, O_WRONLY | O_TRUNC | O_CREAT, 0666);
+                    if (fd < 0) {
+                        fprintf(stderr, "******* redir out in failed %d *******\n", errno);
+                        exit(7);
+                }
+
+                dup2(fd, STDOUT_FILENO);
+                close(fd);
+            }
+
+                execvp(params[0], params);
+                perror("we did a lil wuh oh in our chained redirect");
+                exit(1);
+            }
+
+            //parent
+            if (pid > 0){
+                //check if not first
+                if (cmd != cmds->head){
+                    close(ptrail);
+                }
+                //check if not last
+                if (cmd != cmds->tail){
+                    close(filedes[STDOUT_FILENO]);
+                    ptrail = filedes[STDIN_FILENO];
+                }
+
+            }
+            //something went wrong with fork
+            else
+                perror("failed to fork");
+            cmd = cmd->next;    
+        }
+        while(wait(NULL) != -1);
     }
 }
 
@@ -218,6 +384,22 @@ free_list(cmd_list_t *cmd_list)
     // Proof left to the student.
     // You thought I was going to do this for you! HA! You get
     // the enjoyment of doing it for yourself.
+    cmd_t *cmd = cmd_list->head;
+    cmd_t *temp = NULL;
+
+    if (cmd_list == NULL)
+        return;
+
+    //traverse to tail
+    while (cmd) {
+        temp = cmd->next;
+        free_cmd(cmd);
+        free(cmd);
+        cmd = temp;
+    }
+    //we assume we are in the tail now
+    if (cmd_list)
+        free(cmd_list);
 }
 
 void
@@ -234,9 +416,32 @@ print_list(cmd_list_t *cmd_list)
 void
 free_cmd (cmd_t *cmd)
 {
+    param_t *curr = cmd->param_list;
+    param_t *temp = NULL; 
     // Proof left to the student.
     // Yep, on yer own.
     // I beleive in you.
+    // free all the easy ones
+    if (cmd->raw_cmd)
+        free(cmd->raw_cmd);
+    if (cmd->cmd)
+        free(cmd->cmd);
+    if (cmd->input_file_name)
+        free(cmd->input_file_name);
+    if (cmd->output_file_name)
+        free(cmd->output_file_name);
+
+    //iteratively free the param_list
+    while (curr){
+        temp = curr->next;
+        free(curr->param);
+        free(curr);
+        curr = temp;
+    }
+        //free(curr);
+
+    //NEED TO FINISH THIS PART
+    
 }
 
 // Oooooo, this is nice. Show the fully parsed command line in a nice
